@@ -251,6 +251,14 @@ const ActiveOrderCard = ({ order }: { order: any }) => {
           })}
         </div>
       </div>
+
+      {currentStep === 3 && (
+        <div className="mt-4 p-3 bg-emerald-50 rounded-xl border border-emerald-200 text-center">
+          <p className="text-xs font-bold text-emerald-800">
+            🛍️ Your order is ready for pickup! Present your Order ID at the counter to claim.
+          </p>
+        </div>
+      )}
     </div>
   );
 };

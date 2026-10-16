@@ -1,4 +1,5 @@
 import { useState, useEffect, useContext, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import { fetchOrders, removeOrder } from '../api/orderService';
 import { AuthContext } from '../context/AuthContext';
 import { useNotifications } from '../context/NotificationContext';
@@ -35,6 +36,13 @@ const CustomerOrderHistory = () => {
       userOrders.sort((a, b) => new Date(b.date || b.createdAt).getTime() - new Date(a.date || a.createdAt).getTime());
       setMyOrders(userOrders);
 
+      // Keep currently viewed modal order in sync with latest backend status
+      setSelectedOrder((currentSelected: any) => {
+        if (!currentSelected) return null;
+        const updated = userOrders.find(o => o.id === currentSelected.id);
+        return updated || currentSelected;
+      });
+
       // When the customer opens Order History and the relevant new updates are displayed,
       // mark those notifications as read and remove the badge.
       if (userOrders.length > 0 && !hasMarkedReadRef.current) {
@@ -56,7 +64,7 @@ const CustomerOrderHistory = () => {
       if (document.visibilityState !== 'hidden') {
         loadOrders();
       }
-    }, 25000);
+    }, 5000);
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
@@ -93,6 +101,12 @@ const CustomerOrderHistory = () => {
 
   return (
     <div className="container mx-auto p-4 sm:p-6 max-w-4xl py-6 sm:py-8">
+      {/* Page Title */}
+      <div className="mb-6">
+        <h1 className="text-2xl sm:text-3xl font-black text-dark tracking-tight">My Orders</h1>
+        <p className="text-xs sm:text-sm text-gray-500 font-medium">Track your pickup orders and preparation status</p>
+      </div>
+
       {/* Search Box */}
       {myOrders.length > 0 && (
         <div className="relative mb-6">
@@ -115,7 +129,14 @@ const CustomerOrderHistory = () => {
               <Clock size={28} className="text-gray-400" />
             </div>
             <h3 className="text-lg font-bold text-dark mb-1">No Orders Found</h3>
-            <p className="text-gray-500 text-xs max-w-xs mx-auto">You haven't completed any pickup orders yet. Start ordering to track your history here!</p>
+            <p className="text-gray-500 text-xs max-w-xs mx-auto mb-4">You haven't completed any pickup orders yet. Start ordering to track your history here!</p>
+            <Link 
+              to="/menu" 
+              className="inline-flex items-center gap-1.5 px-4 py-2 bg-primary text-white text-xs font-bold rounded-lg hover:bg-primary/90 transition-colors shadow-2xs"
+            >
+              <Utensils size={14} />
+              <span>Browse Menu</span>
+            </Link>
           </div>
         ) : filteredOrders.length === 0 ? (
           <p className="text-gray-500 p-8 text-center bg-white rounded-xl border border-gray-200 text-sm">No orders match your search.</p>
@@ -137,13 +158,20 @@ const CustomerOrderHistory = () => {
                       (order.status === 'Ready for Pickup' || order.status === 'Ready to Pickup') ? 'bg-purple-50 text-purple-700 border-purple-200' :
                       'bg-yellow-50 text-yellow-700 border-yellow-200'
                     }`}>
-                      {order.status === 'Cooking' ? 'Cooking 🍳' : (order.status === 'Ready to Pickup' ? 'Ready for Pickup' : order.status)}
+                      {order.status === 'Cooking' ? 'Cooking 🍳' : 
+                       (order.status === 'Ready for Pickup' || order.status === 'Ready to Pickup') ? 'Ready for Pickup 🛍️' : 
+                       order.status}
                     </span>
                   </div>
                   <h4 className="font-black text-base text-dark">{formatPrice(order.total)}</h4>
                   <p className="text-xs text-gray-500">
                     {new Date(order.date || order.createdAt).toLocaleDateString(undefined, { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' })}
                   </p>
+                  {(order.status === 'Ready for Pickup' || order.status === 'Ready to Pickup') && (
+                    <div className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-purple-50 text-purple-800 text-[11px] font-bold rounded-md border border-purple-200">
+                      <span>🛍️ Ready to collect at counter!</span>
+                    </div>
+                  )}
                 </div>
               </div>
               
@@ -246,7 +274,7 @@ const CustomerOrderHistory = () => {
                           : 'bg-gray-100 text-gray-400 border-gray-200'
                       }`}>
                         <span className="block text-[9px] uppercase font-bold text-gray-400">Step 3</span>
-                        <span>Ready</span>
+                        <span>Ready for Pickup 🛍️</span>
                       </div>
                       <div className={`p-2 rounded-lg border text-[11px] font-bold transition-all ${
                         selectedOrder.status === 'Completed'
@@ -259,6 +287,40 @@ const CustomerOrderHistory = () => {
                     </div>
                   </div>
                 )}
+
+                {(selectedOrder.status === 'Ready for Pickup' || selectedOrder.status === 'Ready to Pickup') && (
+                  <div className="bg-purple-50 p-4 rounded-xl border-2 border-dashed border-purple-300 text-center">
+                    <span className="text-2xl block mb-1">🛍️</span>
+                    <h5 className="text-xs font-black text-purple-900 uppercase tracking-wider mb-1">Your Order is Ready for Pickup!</h5>
+                    <p className="text-xs text-purple-800 font-medium leading-relaxed">
+                      Your items have been prepared and packed. Please present your Order ID <strong className="font-mono text-purple-950 font-bold">#{selectedOrder.id}</strong> to our staff at the counter to collect your order.
+                    </p>
+                  </div>
+                )}
+
+                {/* Detailed Order Metadata */}
+                <div className="bg-gray-50/70 p-3.5 rounded-lg border border-gray-200 text-xs grid grid-cols-2 gap-3">
+                  <div>
+                    <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider block mb-0.5">Order Type</span>
+                    <span className="font-bold text-dark">{selectedOrder.orderType || 'Online'}</span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider block mb-0.5">Payment Method</span>
+                    <span className="font-bold text-dark">{selectedOrder.paymentMethod || 'Cash'} ({selectedOrder.paymentStatus || 'Unpaid'})</span>
+                  </div>
+                  {selectedOrder.customer?.name && (
+                    <div>
+                      <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider block mb-0.5">Customer Name</span>
+                      <span className="font-bold text-dark truncate block">{selectedOrder.customer.name}</span>
+                    </div>
+                  )}
+                  {selectedOrder.customer?.phone && (
+                    <div>
+                      <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider block mb-0.5">Contact Phone</span>
+                      <span className="font-bold text-dark">{selectedOrder.customer.phone}</span>
+                    </div>
+                  )}
+                </div>
                 
                 <div className="pt-4 border-t border-gray-200 flex justify-between items-end">
                    <div>
@@ -271,7 +333,9 @@ const CustomerOrderHistory = () => {
                       (selectedOrder.status === 'Ready for Pickup' || selectedOrder.status === 'Ready to Pickup') ? 'bg-purple-50 text-purple-700 border-purple-200' :
                       'bg-primary/10 text-primary border-primary/20'
                     }`}>
-                      {selectedOrder.status === 'Cooking' ? 'Cooking 🍳' : (selectedOrder.status === 'Ready to Pickup' ? 'Ready for Pickup' : selectedOrder.status)}
+                      {selectedOrder.status === 'Cooking' ? 'Cooking 🍳' : 
+                       (selectedOrder.status === 'Ready for Pickup' || selectedOrder.status === 'Ready to Pickup') ? 'Ready for Pickup 🛍️' : 
+                       selectedOrder.status}
                     </span>
                   </div>
                   <div className="text-right">

@@ -41,6 +41,8 @@ export interface IOrder extends Document {
   inventoryDeducted?: boolean;
   inventoryRestored?: boolean;
   inventoryRestoredAt?: Date | null;
+  pickupNotificationSent?: boolean;
+  pickupNotificationSentAt?: Date | null;
   orderType: 'POS' | 'Online';
   paymentScreenshot?: string;
   adminViewed?: boolean;
@@ -125,6 +127,8 @@ const OrderSchema: Schema<IOrder> = new Schema(
     inventoryDeducted: { type: Boolean, default: true, index: true },
     inventoryRestored: { type: Boolean, default: false, index: true },
     inventoryRestoredAt: { type: Date, default: null },
+    pickupNotificationSent: { type: Boolean, default: false, index: true },
+    pickupNotificationSentAt: { type: Date, default: null },
     orderType: { 
       type: String, 
       enum: ['POS', 'Online'], 

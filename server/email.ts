@@ -205,7 +205,9 @@ export function extractCustomerEmail(order: any): string | null {
   if (!order) return null;
   const candidates = [
     order.customer?.email,
-    order.userEmail
+    order.userEmail,
+    order.email,
+    order.customerEmail
   ];
   for (const candidate of candidates) {
     if (typeof candidate === 'string') {

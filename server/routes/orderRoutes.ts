@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { Order, Product, InventoryItem, InventoryLog, User } from '../models';
 import { getDbStatus, memoryStore, mongoose } from '../db';
 import { authenticateToken, requireAdminOrStaff } from '../auth';
+import { sendOrderStatusEmail } from '../email';
 
 const router = Router();
 
@@ -106,10 +107,13 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
       if (!isPrivileged) {
         // Strict Customer Isolation: Customer MUST only retrieve their own orders.
         // Ignore any client-supplied email or orderIds parameters meant to widen access.
+        const safeEmail = (currentUser.email || '').trim();
+        const escaped = safeEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const emailRegex = new RegExp(`^${escaped}$`, 'i');
         andConditions.push({
           $or: [
-            { userEmail: currentUser.email },
-            { 'customer.email': currentUser.email }
+            { userEmail: emailRegex },
+            { 'customer.email': emailRegex }
           ]
         });
       } else {
@@ -628,6 +632,8 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
       inventoryDeducted: true,
       inventoryRestored: false,
       inventoryRestoredAt: null,
+      pickupNotificationSent: false,
+      pickupNotificationSentAt: null,
       orderType: finalOrderType,
       paymentScreenshot: req.body.paymentScreenshot || '',
       adminViewed: finalOrderType === 'POS' ? true : false,
@@ -968,8 +974,13 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
             return { httpStatus: 200, body: normalizeOrderEmail(order.toObject ? order.toObject() : order) };
           }
 
-          // Non-cancellation status update (e.g. Paid, Processing, etc.)
+          // Non-cancellation status update (e.g. Paid, Processing, Ready for Pickup, Completed, etc.)
           if (status !== 'Cancelled') {
+            const prevStatus = order.status;
+            const isReadyForPickup = status === 'Ready for Pickup' || status === 'Ready to Pickup';
+            const wasReadyForPickup = prevStatus === 'Ready for Pickup' || prevStatus === 'Ready to Pickup';
+            const isReadyForPickupTransition = isReadyForPickup && !wasReadyForPickup && !order.pickupNotificationSent;
+
             order.status = status;
             if (status === 'Paid' || status === 'Completed') {
               order.paymentStatus = 'Paid';
@@ -978,12 +989,29 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
               order.adminViewed = false;
               order.adminViewedAt = null;
             }
+            if (isReadyForPickupTransition) {
+              order.pickupNotificationSent = true;
+              order.pickupNotificationSentAt = new Date();
+            }
+
             await order.save(sessionOpt);
             if (session) {
               await session.commitTransaction();
               session.endSession();
             }
-            return { httpStatus: 200, body: normalizeOrderEmail(order.toObject ? order.toObject() : order) };
+
+            const cleanOrder = normalizeOrderEmail(order.toObject ? order.toObject() : order);
+
+            // Trigger pickup email notification outside transaction so email errors do not fail the status change
+            if (isReadyForPickupTransition) {
+              try {
+                await sendOrderStatusEmail(cleanOrder, 'Ready for Pickup');
+              } catch (emailErr) {
+                console.error('[Order Status] Failed to send Ready for Pickup notification email:', emailErr);
+              }
+            }
+
+            return { httpStatus: 200, body: cleanOrder };
           }
 
           // Cancelling an eligible order:
@@ -1220,6 +1248,11 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
     }
 
     if (status !== 'Cancelled') {
+      const prevStatus = targetOrder.status;
+      const isReadyForPickup = status === 'Ready for Pickup' || status === 'Ready to Pickup';
+      const wasReadyForPickup = prevStatus === 'Ready for Pickup' || prevStatus === 'Ready to Pickup';
+      const isReadyForPickupTransition = isReadyForPickup && !wasReadyForPickup && !targetOrder.pickupNotificationSent;
+
       targetOrder.status = status;
       if (status === 'Paid' || status === 'Completed') {
         targetOrder.paymentStatus = 'Paid';
@@ -1228,7 +1261,23 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
         targetOrder.adminViewed = false;
         targetOrder.adminViewedAt = null;
       }
-      return res.json(normalizeOrderEmail(targetOrder));
+      if (isReadyForPickupTransition) {
+        targetOrder.pickupNotificationSent = true;
+        targetOrder.pickupNotificationSentAt = new Date();
+      }
+
+      const cleanOrder = normalizeOrderEmail(targetOrder);
+
+      // Trigger pickup email notification so email errors do not fail the status change
+      if (isReadyForPickupTransition) {
+        try {
+          await sendOrderStatusEmail(cleanOrder, 'Ready for Pickup');
+        } catch (emailErr) {
+          console.error('[Order Status] Failed to send Ready for Pickup notification email:', emailErr);
+        }
+      }
+
+      return res.json(cleanOrder);
     }
 
     // Cancelling in memoryStore:
