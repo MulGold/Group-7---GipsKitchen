@@ -7,6 +7,10 @@ export interface IOrderItem {
   quantity: number;
   inventoryLinkId?: string | null;
   inventoryLinkIds?: string[];
+  ingredients?: Array<{
+    inventoryId: string;
+    deductionQty: number;
+  }>;
   unit?: string;
   image?: string;
   category?: string;
@@ -34,6 +38,9 @@ export interface IOrder extends Document {
   paymentStatus: 'Unpaid' | 'Paid' | 'Refunded' | 'Cancelled';
   status: 'Pending' | 'Paid' | 'Processing' | 'Cooking' | 'Ready for Pickup' | 'Ready to Pickup' | 'On Delivery' | 'Completed' | 'Cancelled';
   cancelledBy?: 'customer' | 'admin' | 'staff' | null;
+  inventoryDeducted?: boolean;
+  inventoryRestored?: boolean;
+  inventoryRestoredAt?: Date | null;
   orderType: 'POS' | 'Online';
   paymentScreenshot?: string;
   adminViewed?: boolean;
@@ -53,6 +60,16 @@ const OrderItemSchema = new Schema<IOrderItem>(
     quantity: { type: Number, required: true, min: 1 },
     inventoryLinkId: { type: String, default: null },
     inventoryLinkIds: { type: [String], default: [] },
+    ingredients: {
+      type: [
+        {
+          _id: false,
+          inventoryId: { type: String, required: true },
+          deductionQty: { type: Number, required: true }
+        }
+      ],
+      default: []
+    },
     unit: { type: String, default: 'pcs' },
     image: { type: String, default: '' },
     category: { type: String, default: '' }
@@ -105,6 +122,9 @@ const OrderSchema: Schema<IOrder> = new Schema(
       default: null,
       index: true
     },
+    inventoryDeducted: { type: Boolean, default: true, index: true },
+    inventoryRestored: { type: Boolean, default: false, index: true },
+    inventoryRestoredAt: { type: Date, default: null },
     orderType: { 
       type: String, 
       enum: ['POS', 'Online'], 

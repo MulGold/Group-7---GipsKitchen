@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { Order, Product, InventoryItem, InventoryLog, User } from '../models';
-import { getDbStatus, memoryStore } from '../db';
+import { getDbStatus, memoryStore, mongoose } from '../db';
 import { authenticateToken, requireAdminOrStaff } from '../auth';
 
 const router = Router();
@@ -601,6 +601,7 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
         const linkIds: string[] = Array.isArray(item.inventoryLinkIds) && item.inventoryLinkIds.length > 0
           ? item.inventoryLinkIds
           : (item.inventoryLinkId ? [item.inventoryLinkId] : []);
+        const rawIngs = Array.isArray(item.ingredients) ? item.ingredients : [];
         return {
           id: item.id,
           name: item.name,
@@ -608,6 +609,10 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
           quantity: Number(item.quantity),
           inventoryLinkId: linkIds[0] || null,
           inventoryLinkIds: linkIds,
+          ingredients: rawIngs.map((ing: any) => ({
+            inventoryId: String(ing.inventoryId),
+            deductionQty: Number(ing.deductionQty)
+          })),
           unit: item.unit || 'pcs',
           image: item.image || '',
           category: item.category || ''
@@ -620,6 +625,9 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
       paymentMethod: paymentMethod || 'Cash',
       paymentStatus: finalPaymentStatus,
       status: finalStatus,
+      inventoryDeducted: true,
+      inventoryRestored: false,
+      inventoryRestoredAt: null,
       orderType: finalOrderType,
       paymentScreenshot: req.body.paymentScreenshot || '',
       adminViewed: finalOrderType === 'POS' ? true : false,
@@ -629,36 +637,166 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
       date: orderDate
     };
 
+    const isExplicitlyCancelled = finalStatus === 'Cancelled';
+    const explicitInventoryDeducted = req.body.inventoryDeducted;
+    const shouldSkipDeduction = isExplicitlyCancelled || explicitInventoryDeducted === false;
+
     const { isConnected } = await getDbStatus();
 
     // Auto-deduct inventory/product stock
     if (isConnected) {
-      for (const item of items) {
-        const qty = Number(item.quantity) || 1;
-        const numId = Number(item.id);
-        let prod: any = null;
-        if (!isNaN(numId)) {
-          prod = await Product.findOne({ id: numId });
-        } else if (item.id) {
-          prod = await Product.findOne({ id: item.id });
-        }
+      let anyDeducted = false;
+      if (!shouldSkipDeduction) {
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          const qty = Number(item.quantity) || 1;
+          const numId = Number(item.id);
+          let prod: any = null;
+          if (!isNaN(numId)) {
+            prod = await Product.findOne({ id: numId });
+          } else if (item.id) {
+            prod = await Product.findOne({ id: item.id });
+          }
 
-        // Check if item or product has configured ingredients
+          // Check if item or product has configured ingredients
+          const configuredIngredients = (Array.isArray(item.ingredients) && item.ingredients.length > 0)
+            ? item.ingredients
+            : (prod && Array.isArray(prod.ingredients) && prod.ingredients.length > 0)
+              ? prod.ingredients
+              : null;
+
+          if (configuredIngredients && configuredIngredients.length > 0) {
+            // Snapshot recipe ingredients on order item if not already set
+            if (!orderDoc.items[i].ingredients || orderDoc.items[i].ingredients.length === 0) {
+              orderDoc.items[i].ingredients = configuredIngredients.map((ing: any) => ({
+                inventoryId: String(ing.inventoryId),
+                deductionQty: Number(ing.deductionQty)
+              }));
+            }
+
+            // Deduct from each configured ingredient using its specific deductionQty * ordered quantity
+            for (const ing of configuredIngredients) {
+              const invId = String(ing.inventoryId);
+              const deductionRate = Number(ing.deductionQty);
+              if (!invId || isNaN(deductionRate) || deductionRate <= 0) continue;
+
+              const totalDeduction = Number((deductionRate * qty).toFixed(6));
+              const invItem = await InventoryItem.findOne({ id: invId });
+              if (invItem) {
+                const prevQty = Number(invItem.quantity) || 0;
+                const newQty = Math.max(0, Number((prevQty - totalDeduction).toFixed(6)));
+                invItem.quantity = newQty;
+                const threshold = invItem.lowStockThreshold || 10;
+                if (newQty <= threshold && prevQty > threshold) {
+                  invItem.lowStockAcknowledged = false;
+                }
+                await invItem.save();
+                anyDeducted = true;
+
+                // Log the order deduction with actual quantity deducted
+                await InventoryLog.create({
+                  id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                  inventoryId: invId,
+                  itemName: invItem.name,
+                  type: 'order-deduction',
+                  quantityChange: -totalDeduction,
+                  remainingQuantity: newQty,
+                  reason: `Auto-deducted for Order ${orderId}`,
+                  orderId,
+                  performedBy: performerEmail,
+                  date: new Date()
+                });
+              }
+            }
+          } else {
+            // Legacy product deduction: use inventoryLinkIds / inventoryLinkId
+            let linkIds: string[] = [];
+            if (Array.isArray(item.inventoryLinkIds) && item.inventoryLinkIds.length > 0) {
+              linkIds = item.inventoryLinkIds;
+            } else if (item.inventoryLinkId) {
+              linkIds = [item.inventoryLinkId];
+            } else if (prod) {
+              if (Array.isArray(prod.inventoryLinkIds) && prod.inventoryLinkIds.length > 0) {
+                linkIds = prod.inventoryLinkIds;
+              } else if (prod.inventoryLinkId) {
+                linkIds = [prod.inventoryLinkId];
+              }
+            }
+
+            if (linkIds.length > 0) {
+              for (const invId of linkIds) {
+                const invItem = await InventoryItem.findOne({ id: invId });
+                if (invItem) {
+                  const prevQty = Number(invItem.quantity) || 0;
+                  const newQty = Math.max(0, Number((prevQty - qty).toFixed(6)));
+                  invItem.quantity = newQty;
+                  const threshold = invItem.lowStockThreshold || 10;
+                  if (newQty <= threshold && prevQty > threshold) {
+                    invItem.lowStockAcknowledged = false;
+                  }
+                  await invItem.save();
+                  anyDeducted = true;
+
+                  await InventoryLog.create({
+                    id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                    inventoryId: invId,
+                    itemName: invItem.name,
+                    type: 'order-deduction',
+                    quantityChange: -qty,
+                    remainingQuantity: newQty,
+                    reason: `Auto-deducted for Order ${orderId}`,
+                    orderId,
+                    performedBy: performerEmail,
+                    date: new Date()
+                  });
+                }
+              }
+            } else if (prod && prod.stock !== undefined) {
+              prod.stock = Math.max(0, Number(((prod.stock || 0) - qty).toFixed(6)));
+              await prod.save();
+              anyDeducted = true;
+            }
+          }
+        }
+      }
+
+      orderDoc.inventoryDeducted = shouldSkipDeduction ? false : anyDeducted;
+      orderDoc.inventoryRestored = false;
+      orderDoc.inventoryRestoredAt = null;
+
+      const createdOrder = await Order.create(orderDoc);
+      return res.status(201).json(createdOrder);
+    }
+
+    // In-memory fallback deduction
+    let anyDeductedMem = false;
+    if (!shouldSkipDeduction) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const qty = Number(item.quantity) || 1;
+        const prod = memoryStore.products.find(p => p.id === (Number(item.id) || item.id) || String(p.id) === String(item.id));
+
         const configuredIngredients = (Array.isArray(item.ingredients) && item.ingredients.length > 0)
           ? item.ingredients
-          : (prod && Array.isArray(prod.ingredients) && prod.ingredients.length > 0)
-            ? prod.ingredients
+          : (prod && Array.isArray((prod as any).ingredients) && (prod as any).ingredients.length > 0)
+            ? (prod as any).ingredients
             : null;
 
         if (configuredIngredients && configuredIngredients.length > 0) {
-          // Deduct from each configured ingredient using its specific deductionQty * ordered quantity
+          if (!orderDoc.items[i].ingredients || orderDoc.items[i].ingredients.length === 0) {
+            orderDoc.items[i].ingredients = configuredIngredients.map((ing: any) => ({
+              inventoryId: String(ing.inventoryId),
+              deductionQty: Number(ing.deductionQty)
+            }));
+          }
+
           for (const ing of configuredIngredients) {
             const invId = String(ing.inventoryId);
             const deductionRate = Number(ing.deductionQty);
             if (!invId || isNaN(deductionRate) || deductionRate <= 0) continue;
 
             const totalDeduction = Number((deductionRate * qty).toFixed(6));
-            const invItem = await InventoryItem.findOne({ id: invId });
+            const invItem = memoryStore.inventory.find(inv => inv.id === invId);
             if (invItem) {
               const prevQty = Number(invItem.quantity) || 0;
               const newQty = Math.max(0, Number((prevQty - totalDeduction).toFixed(6)));
@@ -667,25 +805,29 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
               if (newQty <= threshold && prevQty > threshold) {
                 invItem.lowStockAcknowledged = false;
               }
-              await invItem.save();
+              anyDeductedMem = true;
 
-              // Log the order deduction with actual quantity deducted
-              await InventoryLog.create({
+              memoryStore.inventoryLogs.push({
                 id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
                 inventoryId: invId,
+                inventoryItemId: invId,
                 itemName: invItem.name,
+                inventoryItemName: invItem.name,
                 type: 'order-deduction',
                 quantityChange: -totalDeduction,
+                quantity: -totalDeduction,
                 remainingQuantity: newQty,
                 reason: `Auto-deducted for Order ${orderId}`,
+                notes: `Auto-deducted for Order ${orderId}`,
                 orderId,
+                performer: performerEmail,
                 performedBy: performerEmail,
-                date: new Date()
+                date: new Date(),
+                timestamp: new Date().toISOString()
               });
             }
           }
         } else {
-          // Legacy product deduction: use inventoryLinkIds / inventoryLinkId
           let linkIds: string[] = [];
           if (Array.isArray(item.inventoryLinkIds) && item.inventoryLinkIds.length > 0) {
             linkIds = item.inventoryLinkIds;
@@ -700,144 +842,49 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
           }
 
           if (linkIds.length > 0) {
-            // Deduct from all linked InventoryItems (1 each per ordered quantity)
             for (const invId of linkIds) {
-              const invItem = await InventoryItem.findOne({ id: invId });
+              const invItem = memoryStore.inventory.find(inv => inv.id === invId);
               if (invItem) {
-                const prevQty = invItem.quantity;
-                const newQty = Math.max(0, prevQty - qty);
+                const prevQty = Number(invItem.quantity) || 0;
+                const newQty = Math.max(0, Number((prevQty - qty).toFixed(6)));
                 invItem.quantity = newQty;
                 const threshold = invItem.lowStockThreshold || 10;
-                if (newQty <= threshold && prevQty > threshold) {
+                if (invItem.quantity <= threshold && prevQty > threshold) {
                   invItem.lowStockAcknowledged = false;
                 }
-                await invItem.save();
+                anyDeductedMem = true;
 
-                // Log the order deduction
-                await InventoryLog.create({
+                memoryStore.inventoryLogs.push({
                   id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
                   inventoryId: invId,
+                  inventoryItemId: invId,
                   itemName: invItem.name,
+                  inventoryItemName: invItem.name,
                   type: 'order-deduction',
                   quantityChange: -qty,
-                  remainingQuantity: newQty,
+                  quantity: -qty,
+                  remainingQuantity: invItem.quantity,
                   reason: `Auto-deducted for Order ${orderId}`,
+                  notes: `Auto-deducted for Order ${orderId}`,
                   orderId,
+                  performer: performerEmail,
                   performedBy: performerEmail,
-                  date: new Date()
+                  date: new Date(),
+                  timestamp: new Date().toISOString()
                 });
               }
             }
-          } else if (prod) {
-            // Manual product stock deduction
-            prod.stock = Math.max(0, (prod.stock || 0) - qty);
-            await prod.save();
+          } else if (prod && prod.stock !== undefined) {
+            prod.stock = Math.max(0, Number(((prod.stock || 0) - qty).toFixed(6)));
+            anyDeductedMem = true;
           }
         }
       }
-
-      const createdOrder = await Order.create(orderDoc);
-      return res.status(201).json(createdOrder);
     }
 
-    // In-memory fallback deduction
-    for (const item of items) {
-      const qty = Number(item.quantity) || 1;
-      const prod = memoryStore.products.find(p => p.id === (Number(item.id) || item.id) || String(p.id) === String(item.id));
-
-      const configuredIngredients = (Array.isArray(item.ingredients) && item.ingredients.length > 0)
-        ? item.ingredients
-        : (prod && Array.isArray((prod as any).ingredients) && (prod as any).ingredients.length > 0)
-          ? (prod as any).ingredients
-          : null;
-
-      if (configuredIngredients && configuredIngredients.length > 0) {
-        // Deduct from each configured ingredient using its specific deductionQty * ordered quantity
-        for (const ing of configuredIngredients) {
-          const invId = String(ing.inventoryId);
-          const deductionRate = Number(ing.deductionQty);
-          if (!invId || isNaN(deductionRate) || deductionRate <= 0) continue;
-
-          const totalDeduction = Number((deductionRate * qty).toFixed(6));
-          const invItem = memoryStore.inventory.find(i => i.id === invId);
-          if (invItem) {
-            const prevQty = Number(invItem.quantity) || 0;
-            const newQty = Math.max(0, Number((prevQty - totalDeduction).toFixed(6)));
-            invItem.quantity = newQty;
-            const threshold = invItem.lowStockThreshold || 10;
-            if (newQty <= threshold && prevQty > threshold) {
-              invItem.lowStockAcknowledged = false;
-            }
-            memoryStore.inventoryLogs.push({
-              id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-              inventoryId: invId,
-              inventoryItemId: invId,
-              itemName: invItem.name,
-              inventoryItemName: invItem.name,
-              type: 'order-deduction',
-              quantityChange: -totalDeduction,
-              quantity: -totalDeduction,
-              remainingQuantity: newQty,
-              reason: `Auto-deducted for Order ${orderId}`,
-              notes: `Auto-deducted for Order ${orderId}`,
-              orderId,
-              performer: performerEmail,
-              performedBy: performerEmail,
-              date: new Date(),
-              timestamp: new Date().toISOString()
-            });
-          }
-        }
-      } else {
-        // Legacy product deduction
-        let linkIds: string[] = [];
-        if (Array.isArray(item.inventoryLinkIds) && item.inventoryLinkIds.length > 0) {
-          linkIds = item.inventoryLinkIds;
-        } else if (item.inventoryLinkId) {
-          linkIds = [item.inventoryLinkId];
-        } else if (prod) {
-          if (Array.isArray(prod.inventoryLinkIds) && prod.inventoryLinkIds.length > 0) {
-            linkIds = prod.inventoryLinkIds;
-          } else if (prod.inventoryLinkId) {
-            linkIds = [prod.inventoryLinkId];
-          }
-        }
-
-        if (linkIds.length > 0) {
-          for (const invId of linkIds) {
-            const invItem = memoryStore.inventory.find(i => i.id === invId);
-            if (invItem) {
-              const prevQty = invItem.quantity;
-              invItem.quantity = Math.max(0, invItem.quantity - qty);
-              const threshold = invItem.lowStockThreshold || 10;
-              if (invItem.quantity <= threshold && prevQty > threshold) {
-                invItem.lowStockAcknowledged = false;
-              }
-              memoryStore.inventoryLogs.push({
-                id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-                inventoryId: invId,
-                inventoryItemId: invId,
-                itemName: invItem.name,
-                inventoryItemName: invItem.name,
-                type: 'order-deduction',
-                quantityChange: -qty,
-                quantity: -qty,
-                remainingQuantity: invItem.quantity,
-                reason: `Auto-deducted for Order ${orderId}`,
-                notes: `Auto-deducted for Order ${orderId}`,
-                orderId,
-                performer: performerEmail,
-                performedBy: performerEmail,
-                date: new Date(),
-                timestamp: new Date().toISOString()
-              });
-            }
-          }
-        } else if (prod) {
-          prod.stock = Math.max(0, (prod.stock || 0) - qty);
-        }
-      }
-    }
+    orderDoc.inventoryDeducted = shouldSkipDeduction ? false : anyDeductedMem;
+    orderDoc.inventoryRestored = false;
+    orderDoc.inventoryRestoredAt = null;
 
     memoryStore.orders.push(orderDoc);
     return res.status(201).json(orderDoc);
@@ -860,116 +907,285 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
 
     const currentUser = req.user!;
     const isPrivileged = currentUser.role === 'admin' || currentUser.role === 'staff';
+    const performerEmail = currentUser.email || getUserEmail(req) || 'system';
     const { isConnected } = await getDbStatus();
 
     if (isConnected) {
-      const order = await Order.findOne({ id });
-      if (!order) {
-        return res.status(404).json({ error: 'Order not found' });
-      }
-
-      // Customer authorization check: customers may only confirm payment or cancel their own pending orders
-      if (!isPrivileged) {
-        const customerEmail = currentUser.email.toLowerCase();
-        const orderUserEmail = (order.userEmail || '').toLowerCase();
-        const orderCustEmail = (order.customer?.email || '').toLowerCase();
-        if (orderUserEmail !== customerEmail && orderCustEmail !== customerEmail) {
-          return res.status(403).json({ error: 'Access denied: You are not authorized to modify this order.' });
+      const executeMongoCancellation = async (useTx: boolean) => {
+        let session: any = null;
+        if (useTx) {
+          try {
+            session = await mongoose.startSession();
+            session.startTransaction();
+          } catch {
+            session = null;
+            useTx = false;
+          }
         }
-        if (status !== 'Cancelled' && status !== 'Paid') {
-          return res.status(403).json({ error: 'Customers are only permitted to confirm payment or cancel pending orders.' });
-        }
-        if (order.status !== 'Pending') {
-          return res.status(400).json({ error: 'Only pending orders can be updated by customer.' });
-        }
-      }
 
-      // Safeguard: A cancelled order must not be able to proceed to Processing, Cooking, Ready for Pickup, or Completed
-      if (order.status === 'Cancelled' && status !== 'Cancelled') {
-        return res.status(400).json({ error: 'This order has been cancelled and cannot proceed to any other status.' });
-      }
+        try {
+          const sessionOpt = session ? { session } : undefined;
+          const orderQuery = Order.findOne({ id });
+          if (session) orderQuery.session(session);
+          const order = await orderQuery;
 
-      const previousStatus = order.status;
-      order.status = status;
-      if (status === 'Paid' || status === 'Completed') {
-        order.paymentStatus = 'Paid';
-      } else if (status === 'Cancelled') {
-        order.paymentStatus = 'Cancelled';
-        if (currentUser.role === 'customer') {
-          order.cancelledBy = 'customer';
-        } else if (currentUser.role === 'admin') {
-          order.cancelledBy = 'admin';
-        } else if (currentUser.role === 'staff') {
-          order.cancelledBy = 'staff';
-        }
-      }
-
-      // When an ONLINE order transitions to database status 'Paid':
-      // set adminViewed = false and reset adminViewedAt so the payment becomes a new admin notification
-      if (status === 'Paid' && order.orderType === 'Online') {
-        order.adminViewed = false;
-        order.adminViewedAt = null;
-      }
-
-      // Auto-restock inventory/products if cancelling an active order
-      if (status === 'Cancelled' && previousStatus !== 'Cancelled') {
-        const performerEmail = getUserEmail(req) || 'system';
-        if (Array.isArray(order.items)) {
-          for (const item of order.items) {
-            const qty = Number(item.quantity) || 1;
-            let linkIds: string[] = [];
-            if (Array.isArray(item.inventoryLinkIds) && item.inventoryLinkIds.length > 0) {
-              linkIds = item.inventoryLinkIds;
-            } else if (item.inventoryLinkId) {
-              linkIds = [item.inventoryLinkId];
-            } else {
-              const numId = Number(item.id);
-              const prod = !isNaN(numId) ? await Product.findOne({ id: numId }) : null;
-              if (prod) {
-                if (Array.isArray(prod.inventoryLinkIds) && prod.inventoryLinkIds.length > 0) {
-                  linkIds = prod.inventoryLinkIds;
-                } else if (prod.inventoryLinkId) {
-                  linkIds = [prod.inventoryLinkId];
-                }
-              }
+          if (!order) {
+            if (session) {
+              await session.abortTransaction();
+              session.endSession();
             }
+            return { httpStatus: 404, body: { error: 'Order not found' } };
+          }
 
-            if (linkIds.length > 0) {
-              for (const invId of linkIds) {
-                const invItem = await InventoryItem.findOne({ id: invId });
-                if (invItem) {
-                  invItem.quantity = (invItem.quantity || 0) + qty;
-                  await invItem.save();
+          // Customer authorization check: customers may only confirm payment or cancel their own pending orders
+          if (!isPrivileged) {
+            const customerEmail = currentUser.email.toLowerCase();
+            const orderUserEmail = (order.userEmail || '').toLowerCase();
+            const orderCustEmail = (order.customer?.email || '').toLowerCase();
+            if (orderUserEmail !== customerEmail && orderCustEmail !== customerEmail) {
+              if (session) { await session.abortTransaction(); session.endSession(); }
+              return { httpStatus: 403, body: { error: 'Access denied: You are not authorized to modify this order.' } };
+            }
+            if (status !== 'Cancelled' && status !== 'Paid') {
+              if (session) { await session.abortTransaction(); session.endSession(); }
+              return { httpStatus: 403, body: { error: 'Customers are only permitted to confirm payment or cancel pending orders.' } };
+            }
+            if (order.status !== 'Pending') {
+              if (session) { await session.abortTransaction(); session.endSession(); }
+              return { httpStatus: 400, body: { error: 'Only pending orders can be updated by customer.' } };
+            }
+          }
 
-                  await InventoryLog.create({
-                    id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-                    inventoryId: invId,
-                    itemName: invItem.name,
-                    type: 'order-cancellation-restock',
-                    quantityChange: qty,
-                    remainingQuantity: invItem.quantity,
-                    reason: `Restocked from Cancelled Order ${id}`,
-                    orderId: id,
-                    performedBy: performerEmail,
-                    date: new Date()
-                  }).catch(() => {});
+          // Safeguard: A cancelled order must not be able to proceed to Processing, Cooking, Ready for Pickup, or Completed
+          if (order.status === 'Cancelled' && status !== 'Cancelled') {
+            if (session) { await session.abortTransaction(); session.endSession(); }
+            return { httpStatus: 400, body: { error: 'This order has been cancelled and cannot proceed to any other status.' } };
+          }
+
+          // Repeated cancellation attempt: if order is already Cancelled or inventory was already restored
+          if (status === 'Cancelled' && (order.status === 'Cancelled' || order.inventoryRestored === true)) {
+            if (session) { await session.abortTransaction(); session.endSession(); }
+            return { httpStatus: 200, body: normalizeOrderEmail(order.toObject ? order.toObject() : order) };
+          }
+
+          // Non-cancellation status update (e.g. Paid, Processing, etc.)
+          if (status !== 'Cancelled') {
+            order.status = status;
+            if (status === 'Paid' || status === 'Completed') {
+              order.paymentStatus = 'Paid';
+            }
+            if (status === 'Paid' && order.orderType === 'Online') {
+              order.adminViewed = false;
+              order.adminViewedAt = null;
+            }
+            await order.save(sessionOpt);
+            if (session) {
+              await session.commitTransaction();
+              session.endSession();
+            }
+            return { httpStatus: 200, body: normalizeOrderEmail(order.toObject ? order.toObject() : order) };
+          }
+
+          // Cancelling an eligible order:
+          // Determine if this order had inventory deducted or reserved
+          let shouldRestore = false;
+          if (order.inventoryDeducted === false) {
+            shouldRestore = false;
+          } else if (order.inventoryDeducted === true) {
+            shouldRestore = true;
+          } else {
+            // Check if deduction logs exist for this order in InventoryLog
+            const deductionLogExists = await InventoryLog.exists({ orderId: id, type: 'order-deduction' });
+            if (deductionLogExists) {
+              shouldRestore = true;
+            } else if (Array.isArray(order.items) && order.items.length > 0) {
+              for (const item of order.items) {
+                if (Array.isArray(item.ingredients) && item.ingredients.length > 0) {
+                  shouldRestore = true;
+                  break;
                 }
-              }
-            } else {
-              const numId = Number(item.id);
-              const prod = !isNaN(numId) ? await Product.findOne({ id: numId }) : null;
-              if (prod) {
-                prod.stock = (prod.stock || 0) + qty;
-                await prod.save();
+                if ((Array.isArray(item.inventoryLinkIds) && item.inventoryLinkIds.length > 0) || item.inventoryLinkId) {
+                  shouldRestore = true;
+                  break;
+                }
+                const numId = Number(item.id);
+                let p: any = null;
+                if (!isNaN(numId)) {
+                  const pQuery = Product.findOne({ id: numId });
+                  if (session) pQuery.session(session);
+                  p = await pQuery;
+                } else if (item.id) {
+                  const pQuery = Product.findById(item.id);
+                  if (session) pQuery.session(session);
+                  p = await pQuery;
+                }
+                if (p && ((p.ingredients && p.ingredients.length > 0) || (p.inventoryLinkIds && p.inventoryLinkIds.length > 0) || p.inventoryLinkId || p.stock !== undefined)) {
+                  shouldRestore = true;
+                  break;
+                }
               }
             }
           }
+
+          // If eligible for inventory restoration:
+          if (shouldRestore && Array.isArray(order.items)) {
+            for (const item of order.items) {
+              const qty = Number(item.quantity) || 1;
+              const numId = Number(item.id);
+              let prod: any = null;
+              if (!isNaN(numId)) {
+                const prodQuery = Product.findOne({ id: numId });
+                if (session) prodQuery.session(session);
+                prod = await prodQuery;
+              } else if (item.id) {
+                const prodQuery = Product.findById(item.id);
+                if (session) prodQuery.session(session);
+                prod = await prodQuery;
+              }
+
+              const configuredIngredients = (Array.isArray(item.ingredients) && item.ingredients.length > 0)
+                ? item.ingredients
+                : (prod && Array.isArray(prod.ingredients) && prod.ingredients.length > 0)
+                  ? prod.ingredients
+                  : null;
+
+              if (configuredIngredients && configuredIngredients.length > 0) {
+                for (const ing of configuredIngredients) {
+                  const invId = String(ing.inventoryId);
+                  const deductionRate = Number(ing.deductionQty);
+                  if (!invId || isNaN(deductionRate) || deductionRate <= 0) continue;
+
+                  const totalRestore = Number((deductionRate * qty).toFixed(6));
+                  const invQuery = InventoryItem.findOne({ id: invId });
+                  if (session) invQuery.session(session);
+                  const invItem = await invQuery;
+
+                  if (invItem) {
+                    const prevQty = Number(invItem.quantity) || 0;
+                    const newQty = Number((prevQty + totalRestore).toFixed(6));
+                    invItem.quantity = newQty;
+                    const threshold = invItem.lowStockThreshold || 10;
+                    if (newQty > threshold) {
+                      invItem.lowStockAcknowledged = false;
+                    }
+                    await invItem.save(sessionOpt);
+
+                    const logRecord = {
+                      id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                      inventoryId: invId,
+                      itemName: invItem.name,
+                      type: 'order-cancellation-restock' as const,
+                      quantityChange: totalRestore,
+                      remainingQuantity: newQty,
+                      reason: `Restocked from Cancelled Order ${id}`,
+                      orderId: id,
+                      performedBy: performerEmail,
+                      date: new Date()
+                    };
+
+                    if (session) {
+                      await InventoryLog.create([logRecord], { session });
+                    } else {
+                      await InventoryLog.create(logRecord);
+                    }
+                  }
+                }
+              } else {
+                let linkIds: string[] = [];
+                if (Array.isArray(item.inventoryLinkIds) && item.inventoryLinkIds.length > 0) {
+                  linkIds = item.inventoryLinkIds;
+                } else if (item.inventoryLinkId) {
+                  linkIds = [item.inventoryLinkId];
+                } else if (prod) {
+                  if (Array.isArray(prod.inventoryLinkIds) && prod.inventoryLinkIds.length > 0) {
+                    linkIds = prod.inventoryLinkIds;
+                  } else if (prod.inventoryLinkId) {
+                    linkIds = [prod.inventoryLinkId];
+                  }
+                }
+
+                if (linkIds.length > 0) {
+                  for (const invId of linkIds) {
+                    const invQuery = InventoryItem.findOne({ id: invId });
+                    if (session) invQuery.session(session);
+                    const invItem = await invQuery;
+
+                    if (invItem) {
+                      const prevQty = Number(invItem.quantity) || 0;
+                      const newQty = Number((prevQty + qty).toFixed(6));
+                      invItem.quantity = newQty;
+                      const threshold = invItem.lowStockThreshold || 10;
+                      if (newQty > threshold) {
+                        invItem.lowStockAcknowledged = false;
+                      }
+                      await invItem.save(sessionOpt);
+
+                      const logRecord = {
+                        id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                        inventoryId: invId,
+                        itemName: invItem.name,
+                        type: 'order-cancellation-restock' as const,
+                        quantityChange: qty,
+                        remainingQuantity: newQty,
+                        reason: `Restocked from Cancelled Order ${id}`,
+                        orderId: id,
+                        performedBy: performerEmail,
+                        date: new Date()
+                      };
+
+                      if (session) {
+                        await InventoryLog.create([logRecord], { session });
+                      } else {
+                        await InventoryLog.create(logRecord);
+                      }
+                    }
+                  }
+                } else if (prod && prod.stock !== undefined) {
+                  prod.stock = Number(((prod.stock || 0) + qty).toFixed(6));
+                  await prod.save(sessionOpt);
+                }
+              }
+            }
+            order.inventoryRestored = true;
+            order.inventoryRestoredAt = new Date();
+          }
+
+          order.status = 'Cancelled';
+          order.paymentStatus = 'Cancelled';
+          if (currentUser.role === 'customer') {
+            order.cancelledBy = 'customer';
+          } else if (currentUser.role === 'admin') {
+            order.cancelledBy = 'admin';
+          } else if (currentUser.role === 'staff') {
+            order.cancelledBy = 'staff';
+          }
+
+          await order.save(sessionOpt);
+
+          if (session) {
+            await session.commitTransaction();
+            session.endSession();
+          }
+
+          return { httpStatus: 200, body: normalizeOrderEmail(order.toObject ? order.toObject() : order) };
+        } catch (err: any) {
+          if (session) {
+            try { await session.abortTransaction(); } catch {}
+            try { session.endSession(); } catch {}
+          }
+          const isTxNotSupported = err?.message?.includes('replica set') || 
+            err?.message?.includes('Transaction numbers') || 
+            err?.code === 20;
+
+          if (useTx && isTxNotSupported) {
+            return executeMongoCancellation(false);
+          }
+          throw err;
         }
-      }
+      };
 
-      await order.save();
-
-      return res.json(order);
+      const result = await executeMongoCancellation(true);
+      return res.status(result.httpStatus).json(result.body);
     }
 
     const orderIdx = memoryStore.orders.findIndex(o => o.id === id);
@@ -977,8 +1193,9 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    const targetOrder = memoryStore.orders[orderIdx];
+
     if (!isPrivileged) {
-      const targetOrder = memoryStore.orders[orderIdx];
       const customerEmail = currentUser.email.toLowerCase();
       const orderUserEmail = (targetOrder.userEmail || '').toLowerCase();
       const orderCustEmail = (targetOrder.customer?.email || '').toLowerCase();
@@ -993,73 +1210,197 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
       }
     }
 
-    if (memoryStore.orders[orderIdx].status === 'Cancelled' && status !== 'Cancelled') {
+    if (targetOrder.status === 'Cancelled' && status !== 'Cancelled') {
       return res.status(400).json({ error: 'This order has been cancelled and cannot proceed to any other status.' });
     }
 
-    const previousStatus = memoryStore.orders[orderIdx].status;
-    memoryStore.orders[orderIdx].status = status;
-    if (status === 'Paid' || status === 'Completed') {
-      memoryStore.orders[orderIdx].paymentStatus = 'Paid';
-    } else if (status === 'Cancelled') {
-      memoryStore.orders[orderIdx].paymentStatus = 'Cancelled';
-      if (currentUser.role === 'customer') {
-        memoryStore.orders[orderIdx].cancelledBy = 'customer';
-      } else if (currentUser.role === 'admin') {
-        memoryStore.orders[orderIdx].cancelledBy = 'admin';
-      } else if (currentUser.role === 'staff') {
-        memoryStore.orders[orderIdx].cancelledBy = 'staff';
+    // Repeated cancellation attempt: if order is already Cancelled or inventory was already restored
+    if (status === 'Cancelled' && (targetOrder.status === 'Cancelled' || targetOrder.inventoryRestored === true)) {
+      return res.json(normalizeOrderEmail(targetOrder));
+    }
+
+    if (status !== 'Cancelled') {
+      targetOrder.status = status;
+      if (status === 'Paid' || status === 'Completed') {
+        targetOrder.paymentStatus = 'Paid';
+      }
+      if (status === 'Paid' && targetOrder.orderType === 'Online') {
+        targetOrder.adminViewed = false;
+        targetOrder.adminViewedAt = null;
+      }
+      return res.json(normalizeOrderEmail(targetOrder));
+    }
+
+    // Cancelling in memoryStore:
+    let shouldRestore = false;
+    if (targetOrder.inventoryDeducted === false) {
+      shouldRestore = false;
+    } else if (targetOrder.inventoryDeducted === true) {
+      shouldRestore = true;
+    } else {
+      const hasDeductionLog = memoryStore.inventoryLogs.some(l => l.orderId === id && l.type === 'order-deduction');
+      if (hasDeductionLog) {
+        shouldRestore = true;
+      } else if (Array.isArray(targetOrder.items) && targetOrder.items.length > 0) {
+        for (const item of targetOrder.items) {
+          if (Array.isArray(item.ingredients) && item.ingredients.length > 0) {
+            shouldRestore = true;
+            break;
+          }
+          if ((Array.isArray(item.inventoryLinkIds) && item.inventoryLinkIds.length > 0) || item.inventoryLinkId) {
+            shouldRestore = true;
+            break;
+          }
+          const prod = memoryStore.products.find(p => p.id === Number(item.id) || p.id === item.id || String(p.id) === String(item.id));
+          if (prod && ((prod.ingredients && prod.ingredients.length > 0) || (prod.inventoryLinkIds && prod.inventoryLinkIds.length > 0) || prod.inventoryLinkId || prod.stock !== undefined)) {
+            shouldRestore = true;
+            break;
+          }
+        }
       }
     }
 
-    // When an ONLINE order transitions to database status 'Paid':
-    // set adminViewed = false and reset adminViewedAt so the payment becomes a new admin notification
-    if (status === 'Paid' && memoryStore.orders[orderIdx].orderType === 'Online') {
-      memoryStore.orders[orderIdx].adminViewed = false;
-      memoryStore.orders[orderIdx].adminViewedAt = null;
-    }
+    if (shouldRestore && Array.isArray(targetOrder.items)) {
+      const inventorySnapshots = new Map<string, number>();
+      const productSnapshots = new Map<any, number>();
+      const pendingLogs: any[] = [];
 
-    if (status === 'Cancelled' && previousStatus !== 'Cancelled') {
-      const targetOrder = memoryStore.orders[orderIdx];
-      if (Array.isArray(targetOrder.items)) {
+      try {
         for (const item of targetOrder.items) {
           const qty = Number(item.quantity) || 1;
-          let linkIds: string[] = [];
-          if (Array.isArray(item.inventoryLinkIds) && item.inventoryLinkIds.length > 0) {
-            linkIds = item.inventoryLinkIds;
-          } else if (item.inventoryLinkId) {
-            linkIds = [item.inventoryLinkId];
+          const prod = memoryStore.products.find(p => p.id === Number(item.id) || p.id === item.id || String(p.id) === String(item.id));
+
+          const configuredIngredients = (Array.isArray(item.ingredients) && item.ingredients.length > 0)
+            ? item.ingredients
+            : (prod && Array.isArray(prod.ingredients) && prod.ingredients.length > 0)
+              ? prod.ingredients
+              : null;
+
+          if (configuredIngredients && configuredIngredients.length > 0) {
+            for (const ing of configuredIngredients) {
+              const invId = String(ing.inventoryId);
+              const deductionRate = Number(ing.deductionQty);
+              if (!invId || isNaN(deductionRate) || deductionRate <= 0) continue;
+
+              const totalRestore = Number((deductionRate * qty).toFixed(6));
+              const invItem = memoryStore.inventory.find(inv => inv.id === invId);
+              if (invItem) {
+                if (!inventorySnapshots.has(invId)) {
+                  inventorySnapshots.set(invId, invItem.quantity);
+                }
+                const prevQty = Number(invItem.quantity) || 0;
+                const newQty = Number((prevQty + totalRestore).toFixed(6));
+                invItem.quantity = newQty;
+                const threshold = invItem.lowStockThreshold || 10;
+                if (newQty > threshold) {
+                  invItem.lowStockAcknowledged = false;
+                }
+
+                pendingLogs.push({
+                  id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                  inventoryId: invId,
+                  inventoryItemId: invId,
+                  itemName: invItem.name,
+                  inventoryItemName: invItem.name,
+                  type: 'order-cancellation-restock',
+                  quantityChange: totalRestore,
+                  quantity: totalRestore,
+                  remainingQuantity: newQty,
+                  reason: `Restocked from Cancelled Order ${id}`,
+                  notes: `Restocked from Cancelled Order ${id}`,
+                  orderId: id,
+                  performer: performerEmail,
+                  performedBy: performerEmail,
+                  date: new Date(),
+                  timestamp: new Date().toISOString()
+                });
+              }
+            }
           } else {
-            const prod = memoryStore.products.find(p => p.id === (Number(item.id) || item.id));
-            if (prod) {
+            let linkIds: string[] = [];
+            if (Array.isArray(item.inventoryLinkIds) && item.inventoryLinkIds.length > 0) {
+              linkIds = item.inventoryLinkIds;
+            } else if (item.inventoryLinkId) {
+              linkIds = [item.inventoryLinkId];
+            } else if (prod) {
               if (Array.isArray(prod.inventoryLinkIds) && prod.inventoryLinkIds.length > 0) {
                 linkIds = prod.inventoryLinkIds;
               } else if (prod.inventoryLinkId) {
                 linkIds = [prod.inventoryLinkId];
               }
             }
-          }
 
-          if (linkIds.length > 0) {
-            for (const invId of linkIds) {
-              const invItem = memoryStore.inventory.find(i => i.id === invId);
-              if (invItem) {
-                invItem.quantity = (invItem.quantity || 0) + qty;
+            if (linkIds.length > 0) {
+              for (const invId of linkIds) {
+                const invItem = memoryStore.inventory.find(inv => inv.id === invId);
+                if (invItem) {
+                  if (!inventorySnapshots.has(invId)) {
+                    inventorySnapshots.set(invId, invItem.quantity);
+                  }
+                  const prevQty = Number(invItem.quantity) || 0;
+                  const newQty = Number((prevQty + qty).toFixed(6));
+                  invItem.quantity = newQty;
+                  const threshold = invItem.lowStockThreshold || 10;
+                  if (newQty > threshold) {
+                    invItem.lowStockAcknowledged = false;
+                  }
+
+                  pendingLogs.push({
+                    id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                    inventoryId: invId,
+                    inventoryItemId: invId,
+                    itemName: invItem.name,
+                    inventoryItemName: invItem.name,
+                    type: 'order-cancellation-restock',
+                    quantityChange: qty,
+                    quantity: qty,
+                    remainingQuantity: newQty,
+                    reason: `Restocked from Cancelled Order ${id}`,
+                    notes: `Restocked from Cancelled Order ${id}`,
+                    orderId: id,
+                    performer: performerEmail,
+                    performedBy: performerEmail,
+                    date: new Date(),
+                    timestamp: new Date().toISOString()
+                  });
+                }
               }
-            }
-          } else {
-            const prod = memoryStore.products.find(p => p.id === (Number(item.id) || item.id));
-            if (prod) {
-              prod.stock = (prod.stock || 0) + qty;
+            } else if (prod && prod.stock !== undefined) {
+              if (!productSnapshots.has(prod.id)) {
+                productSnapshots.set(prod.id, prod.stock);
+              }
+              prod.stock = Number(((prod.stock || 0) + qty).toFixed(6));
             }
           }
         }
+
+        memoryStore.inventoryLogs.push(...pendingLogs);
+        targetOrder.inventoryRestored = true;
+        targetOrder.inventoryRestoredAt = new Date();
+      } catch (memErr) {
+        for (const [invId, originalQty] of inventorySnapshots.entries()) {
+          const invItem = memoryStore.inventory.find(inv => inv.id === invId);
+          if (invItem) invItem.quantity = originalQty;
+        }
+        for (const [prodId, originalStock] of productSnapshots.entries()) {
+          const prod = memoryStore.products.find(p => p.id === prodId);
+          if (prod) prod.stock = originalStock;
+        }
+        throw memErr;
       }
     }
 
-    const updatedOrder = memoryStore.orders[orderIdx];
+    targetOrder.status = 'Cancelled';
+    targetOrder.paymentStatus = 'Cancelled';
+    if (currentUser.role === 'customer') {
+      targetOrder.cancelledBy = 'customer';
+    } else if (currentUser.role === 'admin') {
+      targetOrder.cancelledBy = 'admin';
+    } else if (currentUser.role === 'staff') {
+      targetOrder.cancelledBy = 'staff';
+    }
 
-    return res.json(updatedOrder);
+    return res.json(normalizeOrderEmail(targetOrder));
   } catch (error) {
     console.error('Error updating order status:', error);
     res.status(500).json({ error: 'Failed to update order status' });
