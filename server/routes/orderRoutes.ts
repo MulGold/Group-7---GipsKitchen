@@ -35,6 +35,33 @@ function normalizeOrderEmail(order: any): any {
   };
 }
 
+// Helper to look up an InventoryItem document supporting both custom string 'id' and MongoDB '_id'
+export async function findInventoryItemDoc(invId: string | undefined | null, session?: any) {
+  if (!invId) return null;
+  const cleanId = String(invId).trim();
+  const query = InventoryItem.findOne({ id: cleanId });
+  if (session) query.session(session);
+  let item = await query;
+  if (!item && mongoose.isValidObjectId(cleanId)) {
+    const idQuery = InventoryItem.findById(cleanId);
+    if (session) idQuery.session(session);
+    item = await idQuery;
+  }
+  return item;
+}
+
+// In-memory helper to match inventory item by either string 'id' or '_id'
+export function findInventoryItemInMemory(invId: string | undefined | null) {
+  if (!invId) return null;
+  const cleanId = String(invId).trim();
+  return memoryStore.inventory.find(i => 
+    i && (String(i.id) === cleanId || String(i._id) === cleanId)
+  ) || null;
+}
+
+// In-flight concurrency lock to prevent duplicate restoration from parallel requests
+const inFlightCancellationLocks = new Map<string, Promise<{ httpStatus: number; body: any }>>();
+
 let hasBackfilledOrders = false;
 export async function backfillExistingOrderEmails() {
   if (hasBackfilledOrders) return;
@@ -687,7 +714,7 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
               if (!invId || isNaN(deductionRate) || deductionRate <= 0) continue;
 
               const totalDeduction = Number((deductionRate * qty).toFixed(6));
-              const invItem = await InventoryItem.findOne({ id: invId });
+              const invItem = await findInventoryItemDoc(invId);
               if (invItem) {
                 const prevQty = Number(invItem.quantity) || 0;
                 const newQty = Math.max(0, Number((prevQty - totalDeduction).toFixed(6)));
@@ -731,7 +758,7 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
 
             if (linkIds.length > 0) {
               for (const invId of linkIds) {
-                const invItem = await InventoryItem.findOne({ id: invId });
+                const invItem = await findInventoryItemDoc(invId);
                 if (invItem) {
                   const prevQty = Number(invItem.quantity) || 0;
                   const newQty = Math.max(0, Number((prevQty - qty).toFixed(6)));
@@ -802,7 +829,7 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
             if (!invId || isNaN(deductionRate) || deductionRate <= 0) continue;
 
             const totalDeduction = Number((deductionRate * qty).toFixed(6));
-            const invItem = memoryStore.inventory.find(inv => inv.id === invId);
+            const invItem = findInventoryItemInMemory(invId);
             if (invItem) {
               const prevQty = Number(invItem.quantity) || 0;
               const newQty = Math.max(0, Number((prevQty - totalDeduction).toFixed(6)));
@@ -849,7 +876,7 @@ router.post('/', authenticateToken, async (req: Request, res: Response) => {
 
           if (linkIds.length > 0) {
             for (const invId of linkIds) {
-              const invItem = memoryStore.inventory.find(inv => inv.id === invId);
+              const invItem = findInventoryItemInMemory(invId);
               if (invItem) {
                 const prevQty = Number(invItem.quantity) || 0;
                 const newQty = Math.max(0, Number((prevQty - qty).toFixed(6)));
